@@ -1,0 +1,168 @@
+/* Claude Cockpit — Textual CSS */
+
+Screen {
+    background: $surface;
+}
+
+/* ---------- Tab Content ---------- */
+ContentSwitcher {
+    height: 1fr;
+}
+
+/* ---------- Memory Tab ---------- */
+#memory-container {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#memory-sidebar {
+    width: 36;
+    border-right: tall $primary-background;
+}
+
+#memory-search {
+    dock: top;
+    height: 3;
+    padding: 0 1;
+}
+
+#memory-search Input {
+    width: 1fr;
+}
+
+#memory-tree-container {
+    height: 1fr;
+    overflow-y: auto;
+}
+
+#memory-tree {
+    padding: 0;
+}
+
+#memory-preview {
+    width: 1fr;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#memory-preview-title {
+    dock: top;
+    height: 1;
+    background: $primary-background;
+    color: $text;
+    padding: 0 1;
+    text-style: bold;
+}
+
+#memory-preview-content {
+    padding: 0 1;
+    height: 1fr;
+    overflow-y: auto;
+}
+
+#search-results-container {
+    height: 1fr;
+    overflow-y: auto;
+    padding: 0 1;
+}
+
+.search-result {
+    margin-bottom: 1;
+    background: $panel;
+    padding: 0 1;
+}
+
+/* ---------- Tasks Tab ---------- */
+#tasks-container {
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+.task-group-title {
+    text-style: bold;
+    margin-top: 1;
+    margin-bottom: 0;
+    padding: 0 1;
+}
+
+.task-card {
+    margin: 0 0 0 2;
+    padding: 0 1;
+    height: auto;
+}
+
+/* ---------- Plans Tab ---------- */
+#plans-container {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#plans-list {
+    width: 40;
+    border-right: tall $primary-background;
+    overflow-y: auto;
+    padding: 0 1;
+}
+
+#plans-preview {
+    width: 1fr;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+/* ---------- Stats Tab ---------- */
+#stats-container {
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+/* ---------- History Tab ---------- */
+#history-container {
+    height: 1fr;
+}
+
+#history-search {
+    dock: top;
+    height: 3;
+    padding: 0 1;
+}
+
+#history-search Input {
+    width: 1fr;
+}
+
+#history-list {
+    height: 1fr;
+    overflow-y: auto;
+    padding: 0 1;
+}
+
+.history-entry {
+    padding: 0 1;
+    height: auto;
+}
+
+.history-entry:hover {
+    background: $primary-background;
+}
+
+/* ---------- Context Gauge ---------- */
+#context-gauge {
+    dock: bottom;
+    height: 1;
+    background: $panel;
+    padding: 0 1;
+}
+
+/* ---------- General ---------- */
+.hidden {
+    display: none;
+}
+
+TabPane {
+    padding: 0;
+}
+
+TabbedContent {
+    height: 1fr;
+}

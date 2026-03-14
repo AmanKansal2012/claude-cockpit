@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-cockpit"
+version = "0.2.0"
+description = "X-ray vision for your Claude Code brain — TUI dashboard"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=1.0",
+    "rich>=13.0",
+    "watchfiles>=0.21",
+]
+
+[project.optional-dependencies]
+iterm2 = ["iterm2>=2.7"]
+
+[project.scripts]
+cockpit = "cockpit.app:main"
+
+[tool.setuptools.packages.find]
+include = ["cockpit*"]
