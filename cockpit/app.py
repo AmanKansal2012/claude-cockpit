@@ -12,8 +12,11 @@ from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Horizontal, Vertical, VerticalScroll
+from textual.events import MouseDown, MouseMove, MouseUp
+from textual.reactive import var
 from textual.screen import ModalScreen
 from textual.timer import Timer
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Footer,
@@ -33,6 +36,77 @@ from cockpit import data
 
 
 SPARKLINE_CHARS = " ▁▂▃▄▅▆▇█"
+
+
+class ResizeHandle(Widget):
+    """A draggable vertical handle for resizing a sidebar."""
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    ResizeHandle {
+        width: 2;
+        height: 1fr;
+        background: #444444;
+        color: #aaaaaa;
+        content-align: center middle;
+    }
+    ResizeHandle:hover {
+        background: #666666;
+        color: #ffffff;
+    }
+    ResizeHandle:focus {
+        background: #666666;
+        color: #ffffff;
+    }
+    ResizeHandle.-dragging {
+        background: #007acc;
+        color: #ffffff;
+    }
+    """
+
+    _dragging: var[bool] = var(False)
+
+    def __init__(self, target_id: str, min_width: int = 20, max_width: int = 80, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._target_id = target_id
+        self._min_width = min_width
+        self._max_width = max_width
+        self._drag_start_x: int = 0
+        self._start_width: int = 0
+
+    def render(self) -> str:
+        return "▐" * self.size.height
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        target = self.screen.query_one(f"#{self._target_id}")
+        self._dragging = True
+        self._drag_start_x = event.screen_x
+        w = target.styles.width
+        self._start_width = int(w.value) if w is not None and not w.is_auto else target.size.width
+        self.add_class("-dragging")
+        self.capture_mouse()
+        event.stop()
+        event.prevent_default()
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        if not self._dragging:
+            return
+        event.stop()
+        event.prevent_default()
+        delta = event.screen_x - self._drag_start_x
+        new_width = int(self._start_width + delta)
+        new_width = max(self._min_width, min(self._max_width, new_width))
+        target = self.screen.query_one(f"#{self._target_id}")
+        target.styles.width = new_width
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        if self._dragging:
+            self._dragging = False
+            self.remove_class("-dragging")
+            self.release_mouse()
+            event.stop()
+            event.prevent_default()
 
 
 def _log_warn(msg: str) -> None:
@@ -189,6 +263,7 @@ class MemoryTab(TabPane):
                     )
                 with VerticalScroll(id="memory-tree-container"):
                     yield Tree("Memory", id="memory-tree")
+            yield ResizeHandle("memory-sidebar", min_width=20, max_width=80)
             with Vertical(id="memory-preview"):
                 yield Static("Select a file or search to preview", id="memory-preview-title")
                 yield VerticalScroll(Markdown("", id="memory-preview-content"))
