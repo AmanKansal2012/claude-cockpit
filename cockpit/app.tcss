@@ -17,7 +17,6 @@ ContentSwitcher {
 
 #memory-sidebar {
     width: 36;
-    border-right: tall $primary-background;
 }
 
 #memory-search {
