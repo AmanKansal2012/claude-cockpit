@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -25,9 +27,13 @@ PINNED_FILE = CLAUDE_DIR / "cockpit-pinned.json"
 PINNED_PLANS_FILE = CLAUDE_DIR / "cockpit-pinned-plans.json"
 SETTINGS_FILE = CLAUDE_DIR / "cockpit-settings.json"
 EXPORT_DIR = Path.home() / "Desktop"
+CHECKPOINTS_DIR = CLAUDE_DIR / "checkpoints"
+CHECKPOINTS_INDEX = CHECKPOINTS_DIR / "sessions.json"
+GIT_CHECKPOINTS_DIR = CHECKPOINTS_DIR / "git-pending"
+GIT_CHECKPOINTS_INDEX = CHECKPOINTS_DIR / "git-index.json"
 
 # Directories the file watcher should monitor
-WATCH_PATHS = [TASKS_DIR, PLANS_DIR, DEBUG_DIR, STATS_FILE.parent, PROJECTS_DIR]
+WATCH_PATHS = [TASKS_DIR, PLANS_DIR, DEBUG_DIR, STATS_FILE.parent, PROJECTS_DIR, CHECKPOINTS_DIR]
 
 # --- Tuning constants ---
 TAIL_CHUNK_SIZE = 8192
@@ -44,6 +50,16 @@ CHARS_PER_TOKEN = 4
 SESSION_LIST_LIMIT = 100
 MAX_PROJECTS_SCAN = 200
 MAX_FILES_PER_DIR = 500
+CHECKPOINT_RETENTION_DAYS = 30
+CHECKPOINT_MAX_STORAGE_BYTES = 500_000_000  # 500MB
+GIT_SUBPROCESS_TIMEOUT = 10
+GIT_CHECKPOINT_PREFIX = "[cockpit"
+GIT_MAX_DIFF_LINES = 2000
+GIT_CHECKPOINT_MIN_EDITS = 3
+GIT_CHECKPOINT_MAX_WAIT_SECS = 30
+GIT_CHECKPOINT_FORCE_AT_EDITS = 10
+GIT_MAX_INDEX_SIZE = 10 * 1024 * 1024  # 10MB safety cap
+GIT_MAX_INDEX_SESSIONS = 1000
 
 
 def _log_warn(msg: str) -> None:
@@ -193,6 +209,59 @@ class HistoryEntry:
     timestamp: float
     project: str
     session_id: str
+
+
+@dataclass
+class CheckpointSession:
+    session_id: str
+    project: str
+    cwd: str
+    created: float
+    last_action: float
+    action_count: int
+    total_bytes: int
+
+
+@dataclass
+class CheckpointAction:
+    seq: str
+    tool: str
+    file_path: str
+    filename: str
+    timestamp: float
+    iso_time: str
+    size_before: int
+    snapshot_path: Path
+    session_id: str
+    is_rolled_back: bool = False
+
+
+@dataclass
+class GitCheckpoint:
+    commit_hash: str        # Short SHA (12 chars)
+    message: str            # Full commit message
+    timestamp: float
+    iso_time: str
+    files_changed: list[str]
+    insertions: int
+    deletions: int
+    session_id: str
+    is_cockpit: bool = True  # Has [cockpit] prefix
+
+
+@dataclass
+class GitCheckpointSession:
+    session_id: str
+    cwd: str
+    project: str
+    branch: str
+    checkpoint_count: int
+    first_checkpoint_ts: float
+    last_checkpoint_ts: float
+    total_files_changed: int
+    is_git_repo: bool = True
+    has_pending_edits: bool = False
+    pending_edit_count: int = 0
 
 
 @dataclass
@@ -2101,6 +2170,800 @@ def rename_plan(old_path: Path, new_name: str) -> tuple[bool, str]:
         return True, ""
     except OSError as e:
         return False, str(e)
+
+
+# ---------- Checkpoints ----------
+
+
+def get_checkpoint_sessions() -> list[CheckpointSession]:
+    """Load checkpoint sessions from index, sorted by last_action desc."""
+    try:
+        raw = json.loads(CHECKPOINTS_INDEX.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    sessions = []
+    for s in raw:
+        try:
+            sessions.append(CheckpointSession(
+                session_id=s["session_id"],
+                project=s.get("project", "unknown"),
+                cwd=s.get("cwd", ""),
+                created=s.get("created", 0),
+                last_action=s.get("last_action", s.get("created", 0)),
+                action_count=s.get("action_count", 0),
+                total_bytes=s.get("total_bytes", 0),
+            ))
+        except (KeyError, TypeError) as e:
+            _log_warn(f"checkpoint session parse: {e}")
+    sessions.sort(key=lambda s: s.last_action, reverse=True)
+    return sessions
+
+
+def get_checkpoint_actions(session_id: str) -> list[CheckpointAction]:
+    """Load all actions for a checkpoint session, sorted by seq asc."""
+    session_dir = CHECKPOINTS_DIR / session_id
+    if not session_dir.is_dir():
+        return []
+    actions = []
+    for action_dir in sorted(session_dir.iterdir()):
+        if not action_dir.is_dir() or not action_dir.name.isdigit():
+            continue
+        meta_path = action_dir / "meta.json"
+        snapshot_path = action_dir / "snapshot"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+            actions.append(CheckpointAction(
+                seq=action_dir.name,
+                tool=meta.get("tool", "?"),
+                file_path=meta.get("file_path", ""),
+                filename=meta.get("filename", "?"),
+                timestamp=meta.get("timestamp", 0),
+                iso_time=meta.get("iso_time", ""),
+                size_before=meta.get("size_before", 0),
+                snapshot_path=snapshot_path,
+                session_id=session_id,
+                is_rolled_back=meta.get("rolled_back", False),
+            ))
+        except (json.JSONDecodeError, OSError) as e:
+            _log_warn(f"checkpoint action {action_dir}: {e}")
+    return actions
+
+
+def get_checkpoint_diff(action: CheckpointAction) -> str:
+    """Unified diff between snapshot (before edit) and current file state."""
+    if not action.snapshot_path.exists():
+        return "(snapshot file missing)"
+    try:
+        snapshot = action.snapshot_path.read_text(errors="replace")
+    except OSError:
+        return "(cannot read snapshot)"
+
+    current_path = Path(action.file_path)
+    if not current_path.exists():
+        lines = [f"--- {action.filename} (before {action.tool} #{action.seq})",
+                 "+++ /dev/null (file deleted)"]
+        for line in snapshot.splitlines():
+            lines.append(f"-{line}")
+        return "\n".join(lines)
+
+    try:
+        current = current_path.read_text(errors="replace")
+    except OSError:
+        return "(cannot read current file)"
+
+    if snapshot == current:
+        return "(no changes — file matches snapshot)"
+
+    diff = difflib.unified_diff(
+        snapshot.splitlines(keepends=True),
+        current.splitlines(keepends=True),
+        fromfile=f"{action.filename} (before {action.tool} #{action.seq})",
+        tofile=f"{action.filename} (current)",
+    )
+    result = "".join(diff)
+    return result if result else "(no diff)"
+
+
+def rollback_checkpoint(action: CheckpointAction) -> tuple[bool, str]:
+    """Restore file from checkpoint snapshot.
+
+    Creates a .ckpt-backup of the current file before overwriting.
+    Marks the action as rolled back in meta.json.
+    """
+    if not action.snapshot_path.exists():
+        return False, "Snapshot file missing"
+
+    target = Path(action.file_path)
+
+    # Backup current state
+    if target.exists():
+        backup = target.with_suffix(target.suffix + ".ckpt-backup")
+        try:
+            shutil.copy2(target, backup)
+        except OSError as e:
+            return False, f"Cannot create backup: {e}"
+
+    # Atomic restore
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".ckpt-tmp")
+        shutil.copy2(action.snapshot_path, tmp)
+        tmp.rename(target)
+    except OSError as e:
+        return False, f"Restore failed: {e}"
+
+    # Mark as rolled back
+    meta_path = action.snapshot_path.parent / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+        meta["rolled_back"] = True
+        meta["rolled_back_at"] = time.time()
+        _atomic_write(meta_path, json.dumps(meta, indent=2))
+    except (json.JSONDecodeError, OSError) as e:
+        _log_warn(f"mark rolled_back: {e}")
+
+    return True, f"Restored {action.filename} to pre-{action.tool} state"
+
+
+def rollback_session(session_id: str) -> tuple[int, int, str]:
+    """Rollback all actions in a session (reverse order).
+
+    Returns (restored_count, skipped_count, message).
+    """
+    actions = get_checkpoint_actions(session_id)
+    if not actions:
+        return 0, 0, "No actions found"
+
+    restored = 0
+    skipped = 0
+    errors = []
+
+    for action in reversed(actions):
+        if action.is_rolled_back:
+            skipped += 1
+            continue
+        ok, msg = rollback_checkpoint(action)
+        if ok:
+            restored += 1
+        else:
+            skipped += 1
+            errors.append(f"{action.filename}: {msg}")
+
+    summary = f"Restored {restored} file(s)"
+    if skipped:
+        summary += f", skipped {skipped}"
+    if errors:
+        summary += f" — errors: {'; '.join(errors[:3])}"
+    return restored, skipped, summary
+
+
+def delete_checkpoint_session(session_id: str) -> tuple[bool, str]:
+    """Delete all checkpoints for a session and update index."""
+    session_dir = CHECKPOINTS_DIR / session_id
+    if not session_dir.is_dir():
+        return False, "Session not found"
+
+    try:
+        shutil.rmtree(session_dir)
+    except OSError as e:
+        return False, f"Delete failed: {e}"
+
+    # Update index
+    try:
+        raw = json.loads(CHECKPOINTS_INDEX.read_text())
+        raw = [s for s in raw if s.get("session_id") != session_id]
+        _atomic_write(CHECKPOINTS_INDEX, json.dumps(raw, indent=2))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+        _log_warn(f"update index after delete: {e}")
+
+    return True, "Session checkpoints deleted"
+
+
+def cleanup_checkpoints(max_age_days: int = CHECKPOINT_RETENTION_DAYS,
+                        max_bytes: int = CHECKPOINT_MAX_STORAGE_BYTES) -> tuple[int, int]:
+    """Remove old checkpoint sessions. Returns (sessions_removed, bytes_freed)."""
+    if not CHECKPOINTS_DIR.is_dir():
+        return 0, 0
+
+    sessions = get_checkpoint_sessions()
+    cutoff = time.time() - (max_age_days * 86400)
+    removed = 0
+    freed = 0
+
+    # Pass 1: remove sessions older than retention
+    for s in sessions:
+        if s.last_action < cutoff:
+            session_dir = CHECKPOINTS_DIR / s.session_id
+            if session_dir.is_dir():
+                try:
+                    size = sum(f.stat().st_size for f in session_dir.rglob("*") if f.is_file())
+                    shutil.rmtree(session_dir)
+                    freed += size
+                    removed += 1
+                except OSError as e:
+                    _log_warn(f"cleanup {s.session_id}: {e}")
+
+    # Pass 2: if still over max_bytes, remove oldest sessions
+    if max_bytes > 0:
+        remaining = [s for s in get_checkpoint_sessions()]
+        total = sum(s.total_bytes for s in remaining)
+        remaining.sort(key=lambda s: s.last_action)  # oldest first
+        for s in remaining:
+            if total <= max_bytes:
+                break
+            session_dir = CHECKPOINTS_DIR / s.session_id
+            if session_dir.is_dir():
+                try:
+                    size = sum(f.stat().st_size for f in session_dir.rglob("*") if f.is_file())
+                    shutil.rmtree(session_dir)
+                    freed += size
+                    total -= s.total_bytes
+                    removed += 1
+                except OSError as e:
+                    _log_warn(f"cleanup overflow {s.session_id}: {e}")
+
+    # Rebuild index
+    if removed > 0:
+        try:
+            remaining_ids = {d.name for d in CHECKPOINTS_DIR.iterdir() if d.is_dir()}
+            raw = json.loads(CHECKPOINTS_INDEX.read_text())
+            raw = [s for s in raw if s.get("session_id") in remaining_ids]
+            _atomic_write(CHECKPOINTS_INDEX, json.dumps(raw, indent=2))
+        except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+            _log_warn(f"rebuild index after cleanup: {e}")
+
+    return removed, freed
+
+
+def get_checkpoint_storage_stats() -> dict:
+    """Return checkpoint storage summary."""
+    sessions = get_checkpoint_sessions()
+    total_actions = sum(s.action_count for s in sessions)
+    total_bytes = sum(s.total_bytes for s in sessions)
+    oldest = min((s.created for s in sessions), default=0)
+    return {
+        "total_sessions": len(sessions),
+        "total_actions": total_actions,
+        "total_bytes": total_bytes,
+        "oldest_session": oldest,
+    }
+
+
+def is_checkpoints_enabled() -> bool:
+    """Check if checkpoints are enabled in cockpit settings."""
+    try:
+        settings = json.loads(SETTINGS_FILE.read_text())
+        return settings.get("checkpoints_enabled", True)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return True  # Default: enabled
+
+
+def toggle_checkpoints() -> bool:
+    """Toggle checkpoints on/off. Returns new state."""
+    try:
+        settings = json.loads(SETTINGS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        settings = {}
+    new_state = not settings.get("checkpoints_enabled", True)
+    settings["checkpoints_enabled"] = new_state
+    _atomic_write(SETTINGS_FILE, json.dumps(settings, indent=2))
+    return new_state
+
+
+# ---------- Git Checkpoints ----------
+
+_SESSION_ID_SAFE_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+_COMMIT_HASH_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
+
+
+def _validate_session_id(session_id: str) -> bool:
+    """Validate session_id contains only safe characters for filesystem paths."""
+    return bool(_SESSION_ID_SAFE_RE.fullmatch(session_id))
+
+
+def _validate_commit_hash(commit_hash: str) -> bool:
+    """Validate commit hash is a hex string (4-40 chars)."""
+    return bool(_COMMIT_HASH_RE.fullmatch(commit_hash))
+
+
+def _safe_git(cwd: str, *args: str, timeout: int = GIT_SUBPROCESS_TIMEOUT) -> tuple[int, str, str]:
+    """Run a git command safely. Returns (returncode, stdout, stderr)."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.returncode, result.stdout, result.stderr
+    except FileNotFoundError:
+        return -1, "", "git not found"
+    except subprocess.TimeoutExpired:
+        return -1, "", "git command timed out"
+    except OSError as e:
+        return -1, "", str(e)
+
+
+def is_git_repo(cwd: str) -> bool:
+    """Check if cwd is inside a git repository."""
+    rc, _, _ = _safe_git(cwd, "rev-parse", "--is-inside-work-tree")
+    return rc == 0
+
+
+def git_get_branch(cwd: str) -> str:
+    """Get current branch name. Returns empty string on detached HEAD."""
+    rc, out, _ = _safe_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    if rc != 0:
+        return ""
+    branch = out.strip()
+    return "" if branch == "HEAD" else branch
+
+
+def git_is_detached_head(cwd: str) -> bool:
+    """Check if repo is in detached HEAD state."""
+    rc, out, _ = _safe_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    return rc == 0 and out.strip() == "HEAD"
+
+
+def git_has_uncommitted_changes(cwd: str) -> bool:
+    """Check if there are uncommitted changes (staged or unstaged)."""
+    rc, out, _ = _safe_git(cwd, "status", "--porcelain")
+    return rc == 0 and bool(out.strip())
+
+
+def is_git_checkpoints_enabled() -> bool:
+    """Check if git checkpoints are enabled in cockpit settings."""
+    try:
+        settings = json.loads(SETTINGS_FILE.read_text())
+        return settings.get("git_checkpoints_enabled", True)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return True  # Default: enabled
+
+
+def toggle_git_checkpoints() -> tuple[bool, str]:
+    """Toggle git checkpoints on/off. Returns (new_state, message)."""
+    try:
+        settings = json.loads(SETTINGS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        settings = {}
+    new_state = not settings.get("git_checkpoints_enabled", True)
+    settings["git_checkpoints_enabled"] = new_state
+    _atomic_write(SETTINGS_FILE, json.dumps(settings, indent=2))
+    label = "enabled" if new_state else "disabled"
+    return new_state, f"Git checkpoints {label}"
+
+
+def get_git_checkpoint_sessions() -> list[GitCheckpointSession]:
+    """Load git checkpoint sessions from index, sorted by last_checkpoint desc."""
+    sessions: list[GitCheckpointSession] = []
+    # Load from git-index.json (with size guard)
+    try:
+        if GIT_CHECKPOINTS_INDEX.exists() and GIT_CHECKPOINTS_INDEX.stat().st_size > GIT_MAX_INDEX_SIZE:
+            _log_warn(f"git-index.json exceeds {GIT_MAX_INDEX_SIZE} bytes, skipping")
+            raw = []
+        else:
+            raw = json.loads(GIT_CHECKPOINTS_INDEX.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        raw = []
+    for s in raw:
+        try:
+            sessions.append(GitCheckpointSession(
+                session_id=s["session_id"],
+                cwd=s.get("cwd", ""),
+                project=s.get("project", "unknown"),
+                branch=s.get("branch", ""),
+                checkpoint_count=s.get("checkpoint_count", 0),
+                first_checkpoint_ts=s.get("first_checkpoint_ts", 0),
+                last_checkpoint_ts=s.get("last_checkpoint_ts", 0),
+                total_files_changed=s.get("total_files_changed", 0),
+            ))
+        except (KeyError, TypeError) as e:
+            _log_warn(f"git checkpoint session parse: {e}")
+
+    # Check pending accumulators
+    if GIT_CHECKPOINTS_DIR.is_dir():
+        for pending in GIT_CHECKPOINTS_DIR.glob("*.json"):
+            if pending.name.endswith(".lock"):
+                continue
+            try:
+                acc = json.loads(pending.read_text())
+                sid = acc.get("session_id", "")
+                existing = next((s for s in sessions if s.session_id == sid), None)
+                if existing:
+                    existing.has_pending_edits = True
+                    existing.pending_edit_count = len(acc.get("edits", []))
+                else:
+                    # Session only has pending edits, no commits yet
+                    cwd = acc.get("cwd", "")
+                    sessions.append(GitCheckpointSession(
+                        session_id=sid,
+                        cwd=cwd,
+                        project=Path(cwd).name if cwd else "unknown",
+                        branch="",
+                        checkpoint_count=0,
+                        first_checkpoint_ts=acc.get("first_edit_ts", 0),
+                        last_checkpoint_ts=acc.get("last_edit_ts", 0),
+                        total_files_changed=0,
+                        has_pending_edits=True,
+                        pending_edit_count=len(acc.get("edits", [])),
+                    ))
+            except (json.JSONDecodeError, OSError) as e:
+                _log_warn(f"read pending accumulator {pending}: {e}")
+
+    sessions.sort(key=lambda s: s.last_checkpoint_ts, reverse=True)
+    return sessions
+
+
+def get_git_checkpoints(session_id: str, cwd: str, limit: int = 100) -> list[GitCheckpoint]:
+    """Get git checkpoints for a session from git log. Returns newest first."""
+    if not cwd or not is_git_repo(cwd):
+        return []
+    rc, out, _ = _safe_git(
+        cwd, "log",
+        f"-{limit}",
+        f"--grep={GIT_CHECKPOINT_PREFIX}",
+        "--format=%H|%at|%s",
+        timeout=GIT_SUBPROCESS_TIMEOUT,
+    )
+    if rc != 0 or not out.strip():
+        return []
+
+    checkpoints: list[GitCheckpoint] = []
+    for line in out.strip().splitlines():
+        parts = line.split("|", 2)
+        if len(parts) < 3:
+            continue
+        commit_hash = parts[0]  # Full hash stored, truncated for display only
+        try:
+            ts = float(parts[1])
+        except ValueError:
+            continue
+        message = parts[2]
+
+        # Get file stats for this commit
+        rc2, numstat, _ = _safe_git(
+            cwd, "diff-tree", "--no-commit-id", "--numstat", "-r", parts[0],
+        )
+        files_changed: list[str] = []
+        insertions = 0
+        deletions = 0
+        if rc2 == 0 and numstat.strip():
+            for stat_line in numstat.strip().splitlines():
+                stat_parts = stat_line.split("\t")
+                if len(stat_parts) >= 3:
+                    try:
+                        ins = int(stat_parts[0]) if stat_parts[0] != "-" else 0
+                        dels = int(stat_parts[1]) if stat_parts[1] != "-" else 0
+                        insertions += ins
+                        deletions += dels
+                    except ValueError:
+                        pass
+                    files_changed.append(stat_parts[2])
+
+        iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S")
+        checkpoints.append(GitCheckpoint(
+            commit_hash=commit_hash,
+            message=message,
+            timestamp=ts,
+            iso_time=iso,
+            files_changed=files_changed,
+            insertions=insertions,
+            deletions=deletions,
+            session_id=session_id,
+            is_cockpit=message.startswith(GIT_CHECKPOINT_PREFIX),
+        ))
+
+    return checkpoints
+
+
+def get_git_checkpoint_diff(cwd: str, commit_hash: str) -> str:
+    """Get the diff for a specific git checkpoint commit."""
+    if not cwd or not is_git_repo(cwd):
+        return "(not a git repo)"
+    if not _validate_commit_hash(commit_hash):
+        return "(invalid commit hash)"
+    # Validate commit exists before using in diff
+    rc, _, _ = _safe_git(cwd, "rev-parse", "--verify", commit_hash)
+    if rc != 0:
+        return "(unknown commit)"
+    rc, out, _ = _safe_git(
+        cwd, "diff", f"{commit_hash}~1", commit_hash, "--",
+        timeout=GIT_SUBPROCESS_TIMEOUT,
+    )
+    if rc != 0:
+        # Try without parent (first commit)
+        rc, out, _ = _safe_git(
+            cwd, "diff-tree", "--patch", "--root", commit_hash, "--",
+        )
+        if rc != 0:
+            return "(cannot get diff)"
+    lines = out.splitlines()
+    if len(lines) > GIT_MAX_DIFF_LINES:
+        lines = lines[:GIT_MAX_DIFF_LINES]
+        lines.append(f"\n... (truncated at {GIT_MAX_DIFF_LINES} lines)")
+    return "\n".join(lines)
+
+
+def get_git_uncommitted_diff(cwd: str) -> str:
+    """Get diff of uncommitted changes."""
+    if not cwd or not is_git_repo(cwd):
+        return "(not a git repo)"
+    rc, out, _ = _safe_git(cwd, "diff", "HEAD")
+    if rc != 0:
+        return "(cannot get diff)"
+    lines = out.splitlines()
+    if len(lines) > GIT_MAX_DIFF_LINES:
+        lines = lines[:GIT_MAX_DIFF_LINES]
+        lines.append(f"\n... (truncated at {GIT_MAX_DIFF_LINES} lines)")
+    return "\n".join(lines)
+
+
+def get_git_recent_commits(cwd: str, limit: int = 20) -> list[GitCheckpoint]:
+    """Get recent commits (both cockpit and user) for timeline interleaving."""
+    if not cwd or not is_git_repo(cwd):
+        return []
+    rc, out, _ = _safe_git(
+        cwd, "log", f"-{limit}", "--format=%H|%at|%s",
+    )
+    if rc != 0 or not out.strip():
+        return []
+
+    commits: list[GitCheckpoint] = []
+    for line in out.strip().splitlines():
+        parts = line.split("|", 2)
+        if len(parts) < 3:
+            continue
+        commit_hash = parts[0]  # Full hash stored
+        try:
+            ts = float(parts[1])
+        except ValueError:
+            continue
+        message = parts[2]
+        is_cockpit = message.startswith(GIT_CHECKPOINT_PREFIX)
+
+        # Get numstat only for cockpit commits (save perf for user commits)
+        files_changed: list[str] = []
+        insertions = 0
+        deletions = 0
+        if is_cockpit:
+            rc2, numstat, _ = _safe_git(
+                cwd, "diff-tree", "--no-commit-id", "--numstat", "-r", commit_hash,
+            )
+            if rc2 == 0 and numstat.strip():
+                for stat_line in numstat.strip().splitlines():
+                    stat_parts = stat_line.split("\t")
+                    if len(stat_parts) >= 3:
+                        try:
+                            ins = int(stat_parts[0]) if stat_parts[0] != "-" else 0
+                            dels = int(stat_parts[1]) if stat_parts[1] != "-" else 0
+                            insertions += ins
+                            deletions += dels
+                        except ValueError:
+                            pass
+                        files_changed.append(stat_parts[2])
+
+        iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S")
+        commits.append(GitCheckpoint(
+            commit_hash=commit_hash,
+            message=message,
+            timestamp=ts,
+            iso_time=iso,
+            files_changed=files_changed,
+            insertions=insertions,
+            deletions=deletions,
+            session_id="",
+            is_cockpit=is_cockpit,
+        ))
+    return commits
+
+
+def git_create_manual_checkpoint(cwd: str, message: str, session_id: str) -> tuple[bool, str]:
+    """Create a manual git checkpoint. Stages tracked files, commits with [cockpit manual] prefix."""
+    if not _validate_session_id(session_id):
+        return False, "Invalid session ID"
+    if not is_git_repo(cwd):
+        return False, "Not a git repository"
+    if git_is_detached_head(cwd):
+        return False, "Cannot checkpoint on detached HEAD"
+
+    # Sanitize message: strip newlines, limit length
+    message = message.replace("\n", " ").replace("\r", "").strip()[:200]
+
+    # Stage tracked changes only (git add -u stages all tracked modified files)
+    rc, _, err = _safe_git(cwd, "add", "-u")
+    if rc != 0:
+        return False, f"git add failed: {err}"
+
+    # Check if there's anything staged
+    rc, staged, _ = _safe_git(cwd, "diff", "--cached", "--name-only")
+    if rc != 0 or not staged.strip():
+        return False, "No changes to checkpoint"
+
+    ts = time.strftime("%H:%M:%S")
+    commit_msg = f"[cockpit manual {ts}] {message}"
+    rc, _, err = _safe_git(
+        cwd, "commit", "-m", commit_msg,
+        "--author=Cockpit <cockpit@local>",
+    )
+    if rc != 0:
+        return False, f"git commit failed: {err}"
+
+    # Get SHA (full hash)
+    rc, sha, _ = _safe_git(cwd, "rev-parse", "HEAD")
+    sha = sha.strip() if rc == 0 else "unknown"
+
+    # Update index
+    _update_git_index(session_id, cwd, sha, commit_msg, staged.strip().splitlines())
+
+    return True, f"Checkpoint {sha[:12]}: {message}"
+
+
+def git_rollback_to_checkpoint(cwd: str, commit_hash: str) -> tuple[bool, str]:
+    """Rollback to a git checkpoint. Creates safety tag, then git reset --hard."""
+    if not _validate_commit_hash(commit_hash):
+        return False, "Invalid commit hash"
+    if not is_git_repo(cwd):
+        return False, "Not a git repository"
+
+    # Resolve short hash to full (git rev-parse validates the commit exists)
+    rc, full_hash, _ = _safe_git(cwd, "rev-parse", "--verify", commit_hash)
+    if rc != 0:
+        return False, f"Cannot resolve commit {commit_hash}"
+    full_hash = full_hash.strip()
+
+    # Create safety tag with nanosecond precision to avoid collisions
+    safety_tag = f"cockpit-safety-{time.time_ns()}"
+    rc, _, err = _safe_git(cwd, "tag", safety_tag)
+    if rc != 0:
+        return False, f"Cannot create safety tag: {err}"
+
+    # Reset
+    rc, _, err = _safe_git(cwd, "reset", "--hard", full_hash)
+    if rc != 0:
+        return False, f"git reset failed: {err} (recovery tag: {safety_tag})"
+
+    return True, f"Rolled back to {commit_hash[:8]}. Safety tag: {safety_tag}"
+
+
+def git_squash_checkpoints(cwd: str, from_hash: str, to_hash: str, message: str) -> tuple[bool, str]:
+    """Squash cockpit checkpoints between from_hash and to_hash into one commit."""
+    if not _validate_commit_hash(from_hash) or not _validate_commit_hash(to_hash):
+        return False, "Invalid commit hash"
+    if not is_git_repo(cwd):
+        return False, "Not a git repository"
+    if git_has_uncommitted_changes(cwd):
+        return False, "Cannot squash with uncommitted changes"
+
+    # Sanitize message
+    message = message.replace("\n", " ").replace("\r", "").strip()[:200]
+
+    # Resolve hashes
+    rc, from_full, _ = _safe_git(cwd, "rev-parse", "--verify", from_hash)
+    if rc != 0:
+        return False, f"Cannot resolve {from_hash}"
+    from_full = from_full.strip()
+
+    rc, to_full, _ = _safe_git(cwd, "rev-parse", "--verify", to_hash)
+    if rc != 0:
+        return False, f"Cannot resolve {to_hash}"
+    to_full = to_full.strip()
+
+    # Check for interleaved user commits in the range — refuse if found
+    rc, log_out, _ = _safe_git(
+        cwd, "log", "--format=%H %s", f"{from_full}~1..{to_full}",
+    )
+    if rc == 0 and log_out.strip():
+        for line in log_out.strip().splitlines():
+            parts = line.split(" ", 1)
+            if len(parts) == 2 and not parts[1].startswith("[cockpit"):
+                return False, f"Cannot squash: range contains user commit '{parts[1][:60]}'"
+
+    # Create safety tag with nanosecond precision
+    safety_tag = f"cockpit-safety-{time.time_ns()}"
+    rc, _, err = _safe_git(cwd, "tag", safety_tag)
+    if rc != 0:
+        return False, f"Cannot create safety tag: {err}"
+
+    # Soft reset to the commit before from_hash, keeping to_hash's tree
+    # First reset HEAD to to_hash (so we squash up to the correct point)
+    rc, _, err = _safe_git(cwd, "reset", "--soft", f"{from_full}~1")
+    if rc != 0:
+        rc2, _, _ = _safe_git(cwd, "reset", "--hard", safety_tag)
+        recovery = " (recovered)" if rc2 == 0 else f" (RECOVERY FAILED — use tag: {safety_tag})"
+        return False, f"Squash failed{recovery}: {err}"
+
+    # Re-commit with squash message
+    ts = time.strftime("%H:%M:%S")
+    squash_msg = f"[cockpit squash {ts}] {message}"
+    rc, _, err = _safe_git(
+        cwd, "commit", "-m", squash_msg,
+        "--author=Cockpit <cockpit@local>",
+    )
+    if rc != 0:
+        rc2, _, _ = _safe_git(cwd, "reset", "--hard", safety_tag)
+        recovery = " (recovered)" if rc2 == 0 else f" (RECOVERY FAILED — use tag: {safety_tag})"
+        return False, f"Squash commit failed{recovery}: {err}"
+
+    return True, f"Squashed to single commit. Safety tag: {safety_tag}"
+
+
+def flush_pending_git_checkpoint(session_id: str) -> tuple[bool, str]:
+    """Force-commit any pending accumulated edits for a session."""
+    import subprocess as _subprocess
+
+    if not _validate_session_id(session_id):
+        return False, "Invalid session ID"
+
+    pending_file = GIT_CHECKPOINTS_DIR / f"{session_id}.json"
+    if not pending_file.exists():
+        return False, "No pending edits"
+
+    committer = Path(__file__).parent.parent / "hooks" / "git_committer.py"
+    if not committer.exists():
+        return False, "git_committer.py not found"
+
+    try:
+        result = _subprocess.run(
+            [sys.executable, str(committer), str(pending_file)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return True, "Flushed pending edits"
+        return False, f"Committer failed: {result.stderr[:200]}"
+    except _subprocess.TimeoutExpired:
+        return False, "Committer timed out"
+    except OSError as e:
+        return False, str(e)
+
+
+def _update_git_index(
+    session_id: str, cwd: str, commit_hash: str,
+    message: str, files: list[str],
+) -> None:
+    """Update the git-index.json with a new checkpoint entry."""
+    if not _validate_session_id(session_id):
+        return
+    GIT_CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if GIT_CHECKPOINTS_INDEX.exists() and GIT_CHECKPOINTS_INDEX.stat().st_size > GIT_MAX_INDEX_SIZE:
+            _log_warn(f"git-index.json exceeds size limit, refusing update")
+            return
+        raw = json.loads(GIT_CHECKPOINTS_INDEX.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        raw = []
+
+    # Cap total sessions
+    if len(raw) >= GIT_MAX_INDEX_SESSIONS:
+        # Prune oldest sessions to stay under limit
+        raw.sort(key=lambda s: s.get("last_checkpoint_ts", 0), reverse=True)
+        raw = raw[:GIT_MAX_INDEX_SESSIONS - 1]
+
+    entry = next((s for s in raw if s.get("session_id") == session_id), None)
+    now = time.time()
+    if entry is None:
+        entry = {
+            "session_id": session_id,
+            "cwd": cwd,
+            "project": Path(cwd).name if cwd else "unknown",
+            "branch": git_get_branch(cwd),
+            "checkpoint_count": 0,
+            "first_checkpoint_ts": now,
+            "last_checkpoint_ts": now,
+            "total_files_changed": 0,
+        }
+        raw.append(entry)
+
+    entry["checkpoint_count"] = entry.get("checkpoint_count", 0) + 1
+    entry["last_checkpoint_ts"] = now
+    entry["total_files_changed"] = entry.get("total_files_changed", 0) + len(files)
+    entry["branch"] = git_get_branch(cwd) or entry.get("branch", "")
+
+    _atomic_write(GIT_CHECKPOINTS_INDEX, json.dumps(raw, indent=2))
 
 
 # ---------- Helpers ----------

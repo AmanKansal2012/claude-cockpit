@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import threading
@@ -1766,6 +1767,770 @@ class HistoryTab(TabPane):
 
 
 # ============================================================
+# Checkpoints Tab — Dual-Mode (Git + File Snapshots)
+# ============================================================
+
+
+class RollbackConfirm(ModalScreen):
+    """Confirmation dialog before rolling back a checkpoint."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Cancel"),
+    ]
+
+    def __init__(self, action: data.CheckpointAction, session_rollback: bool = False) -> None:
+        super().__init__()
+        self._action = action
+        self._session_rollback = session_rollback
+
+    def compose(self) -> ComposeResult:
+        with Center():
+            with Vertical(id="rollback-modal"):
+                if self._session_rollback:
+                    yield Static(
+                        f"[bold yellow]Rollback entire session?[/]\n\n"
+                        f"This will restore ALL files to their state before Claude edited them.\n"
+                        f"Current files will be backed up as .ckpt-backup.",
+                        id="rollback-info",
+                    )
+                else:
+                    yield Static(
+                        f"[bold yellow]Rollback {escape(self._action.filename)}?[/]\n\n"
+                        f"Restore to state before {self._action.tool} #{self._action.seq}.\n"
+                        f"Current file will be backed up as {self._action.filename}.ckpt-backup.",
+                        id="rollback-info",
+                    )
+                with Horizontal(id="rollback-buttons"):
+                    yield Button("Rollback", variant="warning", id="rollback-confirm")
+                    yield Button("Cancel", variant="default", id="rollback-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "rollback-confirm":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
+
+    DEFAULT_CSS = """
+    RollbackConfirm {
+        align: center middle;
+    }
+    #rollback-modal {
+        width: 50;
+        height: auto;
+        max-height: 50%;
+        border: round $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+    #rollback-info {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #rollback-buttons {
+        height: 3;
+        align: center middle;
+    }
+    #rollback-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+
+class GitRollbackConfirm(ModalScreen):
+    """Confirmation dialog before git rollback (reset --hard)."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def __init__(self, commit_hash: str, message: str, time_ago: str) -> None:
+        super().__init__()
+        self._hash = commit_hash
+        self._message = message
+        self._time_ago = time_ago
+
+    def compose(self) -> ComposeResult:
+        with Center():
+            with Vertical(id="git-rollback-modal"):
+                yield Static(
+                    f"[bold red]Git Rollback[/]\n\n"
+                    f"Reset to [bold]{self._hash}[/]\n"
+                    f"[dim]{escape(self._message)}[/]\n"
+                    f"[dim]{self._time_ago}[/]\n\n"
+                    f"[yellow]Warning:[/] All changes after this commit will be discarded.\n"
+                    f"A safety tag will be created for recovery.",
+                    id="git-rollback-info",
+                )
+                with Horizontal(id="git-rollback-buttons"):
+                    yield Button("Rollback", variant="error", id="git-rollback-confirm")
+                    yield Button("Cancel", variant="default", id="git-rollback-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "git-rollback-confirm")
+
+    DEFAULT_CSS = """
+    GitRollbackConfirm { align: center middle; }
+    #git-rollback-modal {
+        width: 60; height: auto; max-height: 60%;
+        border: round $error; background: $surface; padding: 1 2;
+    }
+    #git-rollback-info { height: auto; margin-bottom: 1; }
+    #git-rollback-buttons { height: 3; align: center middle; }
+    #git-rollback-buttons Button { margin: 0 1; }
+    """
+
+
+class SquashConfirm(ModalScreen):
+    """Confirmation dialog for squashing cockpit commits."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def __init__(self, commit_count: int, from_hash: str, to_hash: str) -> None:
+        super().__init__()
+        self._count = commit_count
+        self._from = from_hash
+        self._to = to_hash
+
+    def compose(self) -> ComposeResult:
+        with Center():
+            with Vertical(id="squash-modal"):
+                yield Static(
+                    f"[bold yellow]Squash {self._count} cockpit commits?[/]\n\n"
+                    f"Range: {self._from[:8]}..{self._to[:8]}\n"
+                    f"A safety tag will be created for recovery.",
+                    id="squash-info",
+                )
+                yield Input(
+                    placeholder="Squash commit message...",
+                    id="squash-message-input",
+                )
+                with Horizontal(id="squash-buttons"):
+                    yield Button("Squash", variant="warning", id="squash-confirm")
+                    yield Button("Cancel", variant="default", id="squash-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "squash-confirm":
+            msg_input = self.query_one("#squash-message-input", Input)
+            message = msg_input.value.strip() or "squash cockpit checkpoints"
+            self.dismiss(message)
+        else:
+            self.dismiss(None)
+
+    DEFAULT_CSS = """
+    SquashConfirm { align: center middle; }
+    #squash-modal {
+        width: 60; height: auto; max-height: 50%;
+        border: round $warning; background: $surface; padding: 1 2;
+    }
+    #squash-info { height: auto; margin-bottom: 1; }
+    #squash-message-input { margin-bottom: 1; }
+    #squash-buttons { height: 3; align: center middle; }
+    #squash-buttons Button { margin: 0 1; }
+    """
+
+
+class ManualCheckpointInput(ModalScreen):
+    """Input dialog for creating a manual git checkpoint."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Center():
+            with Vertical(id="manual-ckpt-modal"):
+                yield Static(
+                    "[bold cyan]Manual Checkpoint[/]\n\n"
+                    "Create a git commit with your message.",
+                    id="manual-ckpt-info",
+                )
+                yield Input(
+                    placeholder="Checkpoint message...",
+                    id="manual-ckpt-input",
+                )
+                with Horizontal(id="manual-ckpt-buttons"):
+                    yield Button("Create", variant="primary", id="manual-ckpt-confirm")
+                    yield Button("Cancel", variant="default", id="manual-ckpt-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "manual-ckpt-confirm":
+            msg_input = self.query_one("#manual-ckpt-input", Input)
+            message = msg_input.value.strip() or "manual checkpoint"
+            self.dismiss(message)
+        else:
+            self.dismiss(None)
+
+    DEFAULT_CSS = """
+    ManualCheckpointInput { align: center middle; }
+    #manual-ckpt-modal {
+        width: 60; height: auto; max-height: 50%;
+        border: round $accent; background: $surface; padding: 1 2;
+    }
+    #manual-ckpt-info { height: auto; margin-bottom: 1; }
+    #manual-ckpt-input { margin-bottom: 1; }
+    #manual-ckpt-buttons { height: 3; align: center middle; }
+    #manual-ckpt-buttons Button { margin: 0 1; }
+    """
+
+
+class CheckpointsTab(TabPane):
+    """Dual-mode checkpoints — git timeline + file-snapshot fallback."""
+
+    BINDINGS = [
+        Binding("r", "rollback_action", "Rollback", show=True),
+        Binding("c", "manual_checkpoint", "Checkpoint", show=True),
+        Binding("s", "squash", "Squash", show=True),
+        Binding("f", "flush_pending", "Flush", show=True),
+        Binding("x", "delete_session", "Delete", show=True),
+        Binding("g", "toggle_mode", "Toggle Mode", show=True),
+        Binding("enter", "show_diff", "Show Diff", show=True),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("up", "cursor_up", "Up", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__("Checkpoints", id="tab-checkpoints")
+        # Unified session list: tuples of ("git", GitCheckpointSession) or ("file", CheckpointSession)
+        self._all_sessions: list[tuple[str, object]] = []
+        self._selected_session_idx: int = 0
+        # Git mode state
+        self._git_timeline: list[data.GitCheckpoint] = []
+        # File mode state
+        self._file_actions: list[data.CheckpointAction] = []
+        # Active mode for selected session
+        self._active_mode: str = "git"  # "git" or "file"
+        self._selected_timeline_idx: int = -1
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="checkpoints-container"):
+            with Vertical(id="checkpoints-sidebar"):
+                yield Static("[bold]Sessions[/]", id="checkpoints-sidebar-title")
+                yield VerticalScroll(id="checkpoints-sessions")
+            with Vertical(id="checkpoints-main"):
+                yield Static("", id="checkpoints-mode-bar")
+                yield Static("[bold]Timeline[/]", id="checkpoints-timeline-title")
+                yield VerticalScroll(id="checkpoints-timeline")
+                yield Static("", id="checkpoints-diff-title")
+                yield VerticalScroll(id="checkpoints-diff")
+        yield Static("", id="checkpoints-footer")
+
+    def on_mount(self) -> None:
+        self._load_checkpoints()
+
+    def _load_checkpoints(self) -> None:
+        git_sessions = data.get_git_checkpoint_sessions()
+        file_sessions = data.get_checkpoint_sessions()
+        self._all_sessions = (
+            [("git", s) for s in git_sessions] +
+            [("file", s) for s in file_sessions]
+        )
+        self._render_sessions()
+        if self._all_sessions:
+            self._selected_session_idx = 0
+            self._select_session(0)
+        else:
+            self._git_timeline = []
+            self._file_actions = []
+            self._render_mode_bar()
+            self._render_timeline()
+            self._render_empty_diff()
+        self._render_footer()
+
+    def _select_session(self, idx: int) -> None:
+        if idx >= len(self._all_sessions):
+            return
+        mode, session = self._all_sessions[idx]
+        self._active_mode = mode
+        if mode == "git":
+            gs = session  # type: data.GitCheckpointSession
+            self._git_timeline = data.get_git_recent_commits(gs.cwd)
+            self._file_actions = []
+            self._selected_timeline_idx = 0 if self._git_timeline else -1
+        else:
+            fs = session  # type: data.CheckpointSession
+            self._file_actions = data.get_checkpoint_actions(fs.session_id)
+            self._git_timeline = []
+            self._selected_timeline_idx = len(self._file_actions) - 1 if self._file_actions else -1
+        self._render_mode_bar()
+        self._render_timeline()
+        if self._active_mode == "git" and self._git_timeline and self._selected_timeline_idx >= 0:
+            self._show_git_diff(self._git_timeline[self._selected_timeline_idx])
+        elif self._active_mode == "file" and self._file_actions and self._selected_timeline_idx >= 0:
+            self._show_file_diff(self._file_actions[self._selected_timeline_idx])
+        else:
+            self._render_empty_diff()
+
+    def _render_sessions(self) -> None:
+        container = self.query_one("#checkpoints-sessions")
+        container.remove_children()
+        if not self._all_sessions:
+            container.mount(Static(
+                "[dim]No checkpoints yet.\n"
+                "Git checkpoints are created automatically\n"
+                "when Claude edits files in a git repo.[/dim]"
+            ))
+            return
+        for i, (mode, s) in enumerate(self._all_sessions):
+            marker = "[bold cyan]>[/] " if i == self._selected_session_idx else "  "
+            if mode == "git":
+                gs = s  # type: data.GitCheckpointSession
+                badge = "[green]git[/green]"
+                branch = f" ({gs.branch})" if gs.branch else ""
+                pending = f" [yellow]+{gs.pending_edit_count}[/]" if gs.has_pending_edits else ""
+                age = data.time_ago(gs.last_checkpoint_ts) if gs.last_checkpoint_ts else ""
+                widget = Static(
+                    f"{marker}{badge} [bold]{escape(gs.project)}[/]{branch}\n"
+                    f"   {gs.checkpoint_count} ckpts · {gs.total_files_changed} files{pending}\n"
+                    f"   [dim]{age}[/dim]",
+                    classes="checkpoint-session",
+                    name=str(i),
+                )
+            else:
+                fs = s  # type: data.CheckpointSession
+                badge = "[yellow]file[/yellow]"
+                age = data.time_ago(fs.last_action) if fs.last_action else ""
+                size = data.format_size(fs.total_bytes)
+                widget = Static(
+                    f"{marker}{badge} [bold]{escape(fs.project)}[/]\n"
+                    f"   {fs.action_count} actions · {size}\n"
+                    f"   [dim]{age}[/dim]",
+                    classes="checkpoint-session",
+                    name=str(i),
+                )
+            container.mount(widget)
+
+    def _render_mode_bar(self) -> None:
+        bar = self.query_one("#checkpoints-mode-bar", Static)
+        if not self._all_sessions:
+            bar.update("")
+            return
+        if self._selected_session_idx >= len(self._all_sessions):
+            bar.update("")
+            return
+        mode, session = self._all_sessions[self._selected_session_idx]
+        if mode == "git":
+            gs = session
+            branch = gs.branch or "?"
+            ckpts = gs.checkpoint_count
+            files = gs.total_files_changed
+            pending = f" | [yellow]{gs.pending_edit_count} pending[/]" if gs.has_pending_edits else ""
+            bar.update(
+                f" [bold][green]\\[git][/green] {branch} | "
+                f"{ckpts} ckpts | {files} files{pending}[/bold]"
+            )
+        else:
+            fs = session
+            bar.update(
+                f" [bold][yellow]\\[file][/yellow] {fs.project} | "
+                f"{fs.action_count} actions | {data.format_size(fs.total_bytes)}[/bold]"
+            )
+
+    def _render_timeline(self) -> None:
+        container = self.query_one("#checkpoints-timeline")
+        container.remove_children()
+
+        if self._active_mode == "git":
+            self._render_git_timeline(container)
+        else:
+            self._render_file_timeline(container)
+
+    def _render_git_timeline(self, container) -> None:
+        if not self._git_timeline:
+            container.mount(Static("[dim]No commits in this repository.[/dim]"))
+            return
+
+        # Check for uncommitted changes
+        if self._all_sessions and self._selected_session_idx < len(self._all_sessions):
+            _, session = self._all_sessions[self._selected_session_idx]
+            if hasattr(session, "cwd") and data.git_has_uncommitted_changes(session.cwd):
+                uncommitted_marker = (
+                    "[bold cyan]>[/] " if self._selected_timeline_idx == -2 else "  "
+                )
+                container.mount(Static(
+                    f"{uncommitted_marker}[bold yellow]● HEAD (uncommitted)[/]",
+                    classes="checkpoint-action checkpoint-uncommitted",
+                    name="uncommitted",
+                ))
+
+        for i, c in enumerate(self._git_timeline):
+            marker = "[bold cyan]>[/] " if i == self._selected_timeline_idx else "  "
+            if c.is_cockpit:
+                # Strip [cockpit ...] prefix for clean display
+                display_msg = c.message
+                if "]" in display_msg:
+                    display_msg = display_msg.split("]", 1)[1].strip()
+                age = data.time_ago(c.timestamp)
+                file_count = len(c.files_changed)
+                file_label = f"{file_count} file{'s' if file_count != 1 else ''}"
+                stats = f"+{c.insertions}/-{c.deletions}" if c.insertions or c.deletions else ""
+                widget = Static(
+                    f"{marker}[cyan]○[/] [bold]{c.commit_hash}[/]  "
+                    f"{escape(display_msg[:40])}  "
+                    f"[dim]{stats}  {file_label}  {age}[/]",
+                    classes="checkpoint-action",
+                    name=str(i),
+                )
+            else:
+                # User commit — dimmed separator
+                display_msg = c.message[:50]
+                age = data.time_ago(c.timestamp)
+                widget = Static(
+                    f"{marker}[dim]── {escape(display_msg)} ── {age}[/dim]",
+                    classes="checkpoint-action checkpoint-user-commit",
+                    name=str(i),
+                )
+            container.mount(widget)
+
+    def _render_file_timeline(self, container) -> None:
+        if not self._file_actions:
+            container.mount(Static("[dim]No actions in this session.[/dim]"))
+            return
+        for i, a in enumerate(self._file_actions):
+            marker = "[bold cyan]>[/] " if i == self._selected_timeline_idx else "  "
+            tool_color = "yellow" if a.tool == "Edit" else "green"
+            age = data.time_ago(a.timestamp)
+            rolled = " [dim red](rolled back)[/]" if a.is_rolled_back else ""
+            size = data.format_size(a.size_before)
+            widget = Static(
+                f"{marker}[bold]#{a.seq}[/]  "
+                f"[{tool_color}]{a.tool:5s}[/]  "
+                f"[bold]{escape(a.filename)}[/]  "
+                f"[dim]{size} · {age}[/]{rolled}",
+                classes="checkpoint-action",
+                name=str(i),
+            )
+            container.mount(widget)
+
+    def _show_git_diff(self, checkpoint: data.GitCheckpoint) -> None:
+        if not self._all_sessions or self._selected_session_idx >= len(self._all_sessions):
+            return
+        _, session = self._all_sessions[self._selected_session_idx]
+        cwd = getattr(session, "cwd", "")
+        diff_text = data.get_git_checkpoint_diff(cwd, checkpoint.commit_hash)
+        title = self.query_one("#checkpoints-diff-title", Static)
+        title.update(
+            f"[bold]Diff:[/] {checkpoint.commit_hash} — {escape(checkpoint.message[:60])}"
+        )
+        container = self.query_one("#checkpoints-diff")
+        container.remove_children()
+        rendered = self._render_diff(diff_text)
+        container.mount(Static(rendered, classes="checkpoint-diff-content"))
+
+    def _show_uncommitted_diff(self) -> None:
+        if not self._all_sessions or self._selected_session_idx >= len(self._all_sessions):
+            return
+        _, session = self._all_sessions[self._selected_session_idx]
+        cwd = getattr(session, "cwd", "")
+        diff_text = data.get_git_uncommitted_diff(cwd)
+        title = self.query_one("#checkpoints-diff-title", Static)
+        title.update("[bold]Diff:[/] Uncommitted changes")
+        container = self.query_one("#checkpoints-diff")
+        container.remove_children()
+        rendered = self._render_diff(diff_text)
+        container.mount(Static(rendered, classes="checkpoint-diff-content"))
+
+    def _show_file_diff(self, action: data.CheckpointAction) -> None:
+        diff_text = data.get_checkpoint_diff(action)
+        title = self.query_one("#checkpoints-diff-title", Static)
+        title.update(
+            f"[bold]Diff:[/] {escape(action.filename)} "
+            f"(before {action.tool} #{action.seq})"
+        )
+        container = self.query_one("#checkpoints-diff")
+        container.remove_children()
+        rendered = self._render_diff(diff_text)
+        container.mount(Static(rendered, classes="checkpoint-diff-content"))
+
+    def _render_empty_diff(self) -> None:
+        title = self.query_one("#checkpoints-diff-title", Static)
+        title.update("")
+        container = self.query_one("#checkpoints-diff")
+        container.remove_children()
+        container.mount(Static("[dim]Select an entry to see the diff.[/dim]"))
+
+    def _render_diff(self, diff_text: str) -> str:
+        lines = []
+        for line in diff_text.splitlines():
+            esc_line = escape(line)
+            if line.startswith("+++") or line.startswith("---"):
+                lines.append(f"[bold]{esc_line}[/]")
+            elif line.startswith("@@"):
+                lines.append(f"[cyan]{esc_line}[/]")
+            elif line.startswith("+"):
+                lines.append(f"[green]{esc_line}[/]")
+            elif line.startswith("-"):
+                lines.append(f"[red]{esc_line}[/]")
+            else:
+                lines.append(esc_line)
+        return "\n".join(lines)
+
+    def _render_footer(self) -> None:
+        footer = self.query_one("#checkpoints-footer", Static)
+        git_enabled = data.is_git_checkpoints_enabled()
+        file_enabled = data.is_checkpoints_enabled()
+        git_status = "[green]ON[/]" if git_enabled else "[red]OFF[/]"
+        file_status = "[green]ON[/]" if file_enabled else "[red]OFF[/]"
+        if self._active_mode == "git":
+            footer.update(
+                f" [r] Rollback  [c] Checkpoint  [s] Squash  [f] Flush  "
+                f"[x] Delete  [g] Mode  │  "
+                f"Git: {git_status}  File: {file_status}"
+            )
+        else:
+            footer.update(
+                f" [r] Rollback  [x] Delete  [g] Mode  │  "
+                f"Git: {git_status}  File: {file_status}"
+            )
+
+    def on_static_click(self, event: Static.Click) -> None:
+        widget = event.static
+        if "checkpoint-session" in widget.classes and widget.name is not None:
+            idx = int(widget.name)
+            self._selected_session_idx = idx
+            self._render_sessions()
+            self._select_session(idx)
+        elif "checkpoint-action" in widget.classes and widget.name is not None:
+            if widget.name == "uncommitted":
+                self._selected_timeline_idx = -2
+                self._render_timeline()
+                self._show_uncommitted_diff()
+            else:
+                idx = int(widget.name)
+                self._selected_timeline_idx = idx
+                self._render_timeline()
+                if self._active_mode == "git" and idx < len(self._git_timeline):
+                    self._show_git_diff(self._git_timeline[idx])
+                elif self._active_mode == "file" and idx < len(self._file_actions):
+                    self._show_file_diff(self._file_actions[idx])
+
+    def action_cursor_down(self) -> None:
+        if self._active_mode == "git":
+            if not self._git_timeline:
+                return
+            self._selected_timeline_idx = min(
+                self._selected_timeline_idx + 1, len(self._git_timeline) - 1
+            )
+            self._render_timeline()
+            self._show_git_diff(self._git_timeline[self._selected_timeline_idx])
+        else:
+            if not self._file_actions:
+                return
+            self._selected_timeline_idx = min(
+                self._selected_timeline_idx + 1, len(self._file_actions) - 1
+            )
+            self._render_timeline()
+            self._show_file_diff(self._file_actions[self._selected_timeline_idx])
+
+    def action_cursor_up(self) -> None:
+        if self._active_mode == "git":
+            if not self._git_timeline:
+                return
+            self._selected_timeline_idx = max(self._selected_timeline_idx - 1, 0)
+            self._render_timeline()
+            self._show_git_diff(self._git_timeline[self._selected_timeline_idx])
+        else:
+            if not self._file_actions:
+                return
+            self._selected_timeline_idx = max(self._selected_timeline_idx - 1, 0)
+            self._render_timeline()
+            self._show_file_diff(self._file_actions[self._selected_timeline_idx])
+
+    def action_show_diff(self) -> None:
+        if self._active_mode == "git":
+            if self._selected_timeline_idx == -2:
+                self._show_uncommitted_diff()
+            elif 0 <= self._selected_timeline_idx < len(self._git_timeline):
+                self._show_git_diff(self._git_timeline[self._selected_timeline_idx])
+        else:
+            if 0 <= self._selected_timeline_idx < len(self._file_actions):
+                self._show_file_diff(self._file_actions[self._selected_timeline_idx])
+
+    def action_rollback_action(self) -> None:
+        if self._active_mode == "git":
+            self._git_rollback()
+        else:
+            self._file_rollback()
+
+    def _git_rollback(self) -> None:
+        if not (0 <= self._selected_timeline_idx < len(self._git_timeline)):
+            self.notify("No commit selected", severity="warning")
+            return
+        if not self._all_sessions or self._selected_session_idx >= len(self._all_sessions):
+            self.notify("No session selected", severity="warning")
+            return
+        ckpt = self._git_timeline[self._selected_timeline_idx]
+        _, session = self._all_sessions[self._selected_session_idx]
+        cwd = getattr(session, "cwd", None)
+        if not cwd:
+            self.notify("Session has no working directory", severity="error")
+            return
+        age = data.time_ago(ckpt.timestamp)
+
+        # Capture values by default arg binding to prevent stale closure issues
+        def _on_confirm(confirmed: bool | None, _cwd=cwd, _hash=ckpt.commit_hash) -> None:
+            if confirmed:
+                ok, msg = data.git_rollback_to_checkpoint(_cwd, _hash)
+                severity = "information" if ok else "error"
+                self.notify(msg, severity=severity)
+                if ok:
+                    self._load_checkpoints()
+
+        self.app.push_screen(
+            GitRollbackConfirm(ckpt.commit_hash, ckpt.message, age),
+            _on_confirm,
+        )
+
+    def _file_rollback(self) -> None:
+        if not (0 <= self._selected_timeline_idx < len(self._file_actions)):
+            self.notify("No action selected", severity="warning")
+            return
+        action = self._file_actions[self._selected_timeline_idx]
+        if action.is_rolled_back:
+            self.notify("Already rolled back", severity="warning")
+            return
+
+        def _on_confirm(confirmed: bool | None) -> None:
+            if confirmed:
+                ok, msg = data.rollback_checkpoint(action)
+                severity = "information" if ok else "error"
+                self.notify(msg, severity=severity)
+                if ok:
+                    self._load_checkpoints()
+
+        self.app.push_screen(RollbackConfirm(action), _on_confirm)
+
+    def action_manual_checkpoint(self) -> None:
+        if self._active_mode != "git":
+            self.notify("Manual checkpoint only available in git mode", severity="warning")
+            return
+        if not self._all_sessions or self._selected_session_idx >= len(self._all_sessions):
+            self.notify("No session selected", severity="warning")
+            return
+        _, session = self._all_sessions[self._selected_session_idx]
+        cwd = getattr(session, "cwd", None)
+        sid = getattr(session, "session_id", None)
+        if not cwd or not sid:
+            self.notify("Session not properly initialized", severity="error")
+            return
+
+        # Capture values by default arg binding to prevent stale closure issues
+        def _on_message(message: str | None, _cwd=cwd, _sid=sid) -> None:
+            if message:
+                ok, msg = data.git_create_manual_checkpoint(_cwd, message, _sid)
+                severity = "information" if ok else "error"
+                self.notify(msg, severity=severity)
+                if ok:
+                    self._load_checkpoints()
+
+        self.app.push_screen(ManualCheckpointInput(), _on_message)
+
+    def action_squash(self) -> None:
+        if self._active_mode != "git":
+            self.notify("Squash only available in git mode", severity="warning")
+            return
+        if not self._all_sessions or self._selected_session_idx >= len(self._all_sessions):
+            self.notify("No session selected", severity="warning")
+            return
+        # Find cockpit commits to squash
+        cockpit_commits = [c for c in self._git_timeline if c.is_cockpit]
+        if len(cockpit_commits) < 2:
+            self.notify("Need at least 2 cockpit commits to squash", severity="warning")
+            return
+
+        _, session = self._all_sessions[self._selected_session_idx]
+        cwd = getattr(session, "cwd", None)
+        if not cwd:
+            self.notify("Session has no working directory", severity="error")
+            return
+        from_hash = cockpit_commits[-1].commit_hash  # oldest
+        to_hash = cockpit_commits[0].commit_hash  # newest
+
+        # Capture values by default arg binding to prevent stale closure issues
+        def _on_message(message: str | None, _cwd=cwd, _from=from_hash, _to=to_hash) -> None:
+            if message:
+                ok, msg = data.git_squash_checkpoints(_cwd, _from, _to, message)
+                severity = "information" if ok else "error"
+                self.notify(msg, severity=severity)
+                if ok:
+                    self._load_checkpoints()
+
+        self.app.push_screen(
+            SquashConfirm(len(cockpit_commits), from_hash, to_hash),
+            _on_message,
+        )
+
+    def action_flush_pending(self) -> None:
+        if self._active_mode != "git":
+            self.notify("Flush only available in git mode", severity="warning")
+            return
+        if not self._all_sessions or self._selected_session_idx >= len(self._all_sessions):
+            self.notify("No session selected", severity="warning")
+            return
+        _, session = self._all_sessions[self._selected_session_idx]
+        sid = getattr(session, "session_id", None)
+        if not sid:
+            self.notify("Session not properly initialized", severity="error")
+            return
+        ok, msg = data.flush_pending_git_checkpoint(sid)
+        severity = "information" if ok else "warning"
+        self.notify(msg, severity=severity)
+        if ok:
+            self._load_checkpoints()
+
+    def action_delete_session(self) -> None:
+        if not self._all_sessions or self._selected_session_idx >= len(self._all_sessions):
+            self.notify("No session selected", severity="warning")
+            return
+        mode, session = self._all_sessions[self._selected_session_idx]
+        if mode == "git":
+            # Remove from git index only (git commits stay in history)
+            sid = session.session_id
+            try:
+                raw = json.loads(data.GIT_CHECKPOINTS_INDEX.read_text())
+                raw = [s for s in raw if s.get("session_id") != sid]
+                data._atomic_write(data.GIT_CHECKPOINTS_INDEX, json.dumps(raw, indent=2))
+                # Also remove pending accumulator
+                pending = data.GIT_CHECKPOINTS_DIR / f"{sid}.json"
+                if pending.exists():
+                    pending.unlink()
+                self.notify("Removed git session (commits preserved)", severity="information")
+            except Exception as e:
+                self.notify(f"Delete failed: {type(e).__name__}: {e}", severity="error")
+        else:
+            ok, msg = data.delete_checkpoint_session(session.session_id)
+            if ok:
+                self.notify(f"Deleted checkpoints for {session.project}", severity="information")
+            else:
+                self.notify(msg, severity="error")
+        self._selected_session_idx = 0
+        self._load_checkpoints()
+
+    def action_toggle_mode(self) -> None:
+        """Toggle between git-only and file-only views."""
+        git_sessions = [s for s in self._all_sessions if s[0] == "git"]
+        file_sessions = [s for s in self._all_sessions if s[0] == "file"]
+        if not git_sessions and not file_sessions:
+            return
+        # Cycle: all -> git-only -> file-only -> all
+        current_git = len(git_sessions)
+        current_file = len(file_sessions)
+        if current_git > 0 and current_file > 0:
+            # Show git only
+            self._all_sessions = git_sessions
+        elif current_git > 0 and current_file == 0:
+            # Currently git-only, restore all
+            self._load_checkpoints()
+            return
+        elif current_git == 0 and current_file > 0:
+            # Currently file-only, restore all
+            self._load_checkpoints()
+            return
+        self._selected_session_idx = 0
+        self._render_sessions()
+        if self._all_sessions:
+            self._select_session(0)
+        self._render_footer()
+
+
+# ============================================================
 # Main App
 # ============================================================
 
@@ -1777,7 +2542,7 @@ class CockpitApp(App):
     SUB_TITLE = "~/.claude/"
 
     TAB_ORDER = [
-        "tab-memory", "tab-tasks", "tab-plans",
+        "tab-memory", "tab-tasks", "tab-plans", "tab-checkpoints",
         "tab-conversations", "tab-stats", "tab-history",
     ]
 
@@ -1788,6 +2553,7 @@ class CockpitApp(App):
         Binding("m", "switch_tab('tab-memory')", "Memory", show=True),
         Binding("t", "switch_tab('tab-tasks')", "Tasks", show=True),
         Binding("p", "switch_tab('tab-plans')", "Plans", show=True),
+        Binding("k", "switch_tab('tab-checkpoints')", "Checkpoints", show=True),
         Binding("c", "switch_tab('tab-conversations')", "Conversations", show=True),
         Binding("s", "switch_tab('tab-stats')", "Stats", show=True),
         Binding("h", "switch_tab('tab-history')", "History", show=True),
@@ -1812,6 +2578,7 @@ class CockpitApp(App):
             yield MemoryTab()
             yield TasksTab()
             yield PlansTab()
+            yield CheckpointsTab()
             yield ConversationsTab()
             yield StatsTab()
             yield HistoryTab()
@@ -1878,11 +2645,16 @@ class CockpitApp(App):
                         or p.name == "cockpit-pinned.json"
                         for p in changed_paths
                     )
+                    refresh_checkpoints = any(
+                        "checkpoints" in str(p) for p in changed_paths
+                    )
                     refresh_settings = any(
                         p.name == "cockpit-settings.json"
                         for p in changed_paths
                     )
                     # Schedule refreshes on the main thread
+                    if refresh_checkpoints:
+                        self.call_from_thread(self._refresh_tab, "checkpoints")
                     if refresh_convos:
                         self.call_from_thread(self._refresh_tab, "conversations")
                     if refresh_tasks:
@@ -1909,6 +2681,7 @@ class CockpitApp(App):
             "memory": "_load_memory",
             "tasks": "_load_tasks",
             "plans": "_load_plans",
+            "checkpoints": "_load_checkpoints",
             "conversations": "_load_sessions",
             "stats": "_load_stats",
             "history": "_load_history",

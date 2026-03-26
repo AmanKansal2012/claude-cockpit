@@ -1853,3 +1853,245 @@ class TestResourceBounds:
         assert hasattr(data, "MAX_FILES_PER_DIR")
         assert hasattr(data, "CONTEXT_CHARS_ESTIMATE")
         assert hasattr(data, "CHARS_PER_TOKEN")
+        assert hasattr(data, "CHECKPOINT_RETENTION_DAYS")
+        assert hasattr(data, "CHECKPOINT_MAX_STORAGE_BYTES")
+
+
+# ============================================================
+# Checkpoint Tests
+# ============================================================
+
+
+def _make_checkpoint(ckpt_dir, session_id, seq, file_path, content, tool="Edit",
+                     timestamp=None, rolled_back=False):
+    """Helper to create a checkpoint action on disk."""
+    ts = timestamp or time.time()
+    action_dir = ckpt_dir / session_id / f"{seq:04d}"
+    action_dir.mkdir(parents=True, exist_ok=True)
+    (action_dir / "snapshot").write_text(content)
+    meta = {
+        "tool": tool,
+        "file_path": str(file_path),
+        "filename": Path(file_path).name,
+        "timestamp": ts,
+        "iso_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)),
+        "size_before": len(content),
+        "cwd": str(Path(file_path).parent),
+    }
+    if rolled_back:
+        meta["rolled_back"] = True
+    (action_dir / "meta.json").write_text(json.dumps(meta))
+    return action_dir
+
+
+def _make_index(ckpt_dir, entries):
+    """Helper to write sessions.json index."""
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    (ckpt_dir / "sessions.json").write_text(json.dumps(entries, indent=2))
+
+
+class TestCheckpointSessions:
+    def test_empty(self, tmp_path):
+        with patch.object(data, "CHECKPOINTS_INDEX", tmp_path / "sessions.json"):
+            assert data.get_checkpoint_sessions() == []
+
+    def test_loads_sessions(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        index = [
+            {"session_id": "s1", "project": "proj-a", "cwd": "/a",
+             "created": 1000, "last_action": 2000, "action_count": 5, "total_bytes": 1024},
+            {"session_id": "s2", "project": "proj-b", "cwd": "/b",
+             "created": 3000, "last_action": 4000, "action_count": 3, "total_bytes": 512},
+        ]
+        _make_index(ckpt_dir, index)
+        with patch.object(data, "CHECKPOINTS_INDEX", ckpt_dir / "sessions.json"):
+            sessions = data.get_checkpoint_sessions()
+            assert len(sessions) == 2
+            # Sorted by last_action desc
+            assert sessions[0].session_id == "s2"
+            assert sessions[1].session_id == "s1"
+            assert sessions[0].action_count == 3
+
+
+class TestCheckpointActions:
+    def test_loads_actions(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp = tmp_path / "file.py"
+        fp.write_text("current")
+        _make_checkpoint(ckpt_dir, "s1", 1, fp, "v1")
+        _make_checkpoint(ckpt_dir, "s1", 2, fp, "v2")
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir):
+            actions = data.get_checkpoint_actions("s1")
+            assert len(actions) == 2
+            assert actions[0].seq == "0001"
+            assert actions[1].seq == "0002"
+
+    def test_empty_session(self, tmp_path):
+        with patch.object(data, "CHECKPOINTS_DIR", tmp_path):
+            assert data.get_checkpoint_actions("nonexistent") == []
+
+
+class TestCheckpointDiff:
+    def test_diff_modified(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp = tmp_path / "file.py"
+        _make_checkpoint(ckpt_dir, "s1", 1, fp, "line1\nline2\n")
+        fp.write_text("line1\nline2\nline3\n")
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir):
+            actions = data.get_checkpoint_actions("s1")
+            diff = data.get_checkpoint_diff(actions[0])
+            assert "+line3" in diff
+
+    def test_diff_deleted_file(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp = tmp_path / "deleted.py"
+        _make_checkpoint(ckpt_dir, "s1", 1, fp, "original content\n")
+        # File doesn't exist on disk (deleted)
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir):
+            actions = data.get_checkpoint_actions("s1")
+            diff = data.get_checkpoint_diff(actions[0])
+            assert "file deleted" in diff.lower() or "-original content" in diff
+
+    def test_diff_no_changes(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp = tmp_path / "same.py"
+        _make_checkpoint(ckpt_dir, "s1", 1, fp, "same content")
+        fp.write_text("same content")
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir):
+            actions = data.get_checkpoint_actions("s1")
+            diff = data.get_checkpoint_diff(actions[0])
+            assert "no changes" in diff.lower()
+
+
+class TestCheckpointRollback:
+    def test_rollback_restores_file(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp = tmp_path / "file.py"
+        _make_checkpoint(ckpt_dir, "s1", 1, fp, "original")
+        fp.write_text("modified by claude")
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir):
+            actions = data.get_checkpoint_actions("s1")
+            ok, msg = data.rollback_checkpoint(actions[0])
+            assert ok
+            assert fp.read_text() == "original"
+
+    def test_rollback_creates_backup(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp = tmp_path / "file.py"
+        _make_checkpoint(ckpt_dir, "s1", 1, fp, "original")
+        fp.write_text("modified")
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir):
+            actions = data.get_checkpoint_actions("s1")
+            data.rollback_checkpoint(actions[0])
+            backup = fp.with_suffix(".py.ckpt-backup")
+            assert backup.exists()
+            assert backup.read_text() == "modified"
+
+    def test_rollback_marks_rolled_back(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp = tmp_path / "file.py"
+        _make_checkpoint(ckpt_dir, "s1", 1, fp, "original")
+        fp.write_text("modified")
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir):
+            actions = data.get_checkpoint_actions("s1")
+            data.rollback_checkpoint(actions[0])
+            meta = json.loads((ckpt_dir / "s1" / "0001" / "meta.json").read_text())
+            assert meta["rolled_back"] is True
+
+    def test_rollback_session_reverse_order(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp1 = tmp_path / "a.py"
+        fp2 = tmp_path / "b.py"
+        _make_checkpoint(ckpt_dir, "s1", 1, fp1, "a-original")
+        _make_checkpoint(ckpt_dir, "s1", 2, fp2, "b-original")
+        fp1.write_text("a-modified")
+        fp2.write_text("b-modified")
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir):
+            restored, skipped, msg = data.rollback_session("s1")
+            assert restored == 2
+            assert fp1.read_text() == "a-original"
+            assert fp2.read_text() == "b-original"
+
+
+class TestCheckpointCleanup:
+    def test_cleanup_old_sessions(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp = tmp_path / "file.py"
+        old_ts = time.time() - (60 * 86400)  # 60 days ago
+        _make_checkpoint(ckpt_dir, "old-sess", 1, fp, "old", timestamp=old_ts)
+        _make_checkpoint(ckpt_dir, "new-sess", 1, fp, "new")
+
+        _make_index(ckpt_dir, [
+            {"session_id": "old-sess", "project": "p", "cwd": "/",
+             "created": old_ts, "last_action": old_ts, "action_count": 1, "total_bytes": 3},
+            {"session_id": "new-sess", "project": "p", "cwd": "/",
+             "created": time.time(), "last_action": time.time(), "action_count": 1, "total_bytes": 3},
+        ])
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir), \
+             patch.object(data, "CHECKPOINTS_INDEX", ckpt_dir / "sessions.json"):
+            removed, freed = data.cleanup_checkpoints(max_age_days=30)
+            assert removed == 1
+            assert not (ckpt_dir / "old-sess").exists()
+            assert (ckpt_dir / "new-sess").exists()
+
+    def test_storage_stats(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        _make_index(ckpt_dir, [
+            {"session_id": "s1", "project": "p", "cwd": "/",
+             "created": 1000, "last_action": 2000, "action_count": 5, "total_bytes": 1024},
+            {"session_id": "s2", "project": "p", "cwd": "/",
+             "created": 3000, "last_action": 4000, "action_count": 3, "total_bytes": 512},
+        ])
+
+        with patch.object(data, "CHECKPOINTS_INDEX", ckpt_dir / "sessions.json"):
+            stats = data.get_checkpoint_storage_stats()
+            assert stats["total_sessions"] == 2
+            assert stats["total_actions"] == 8
+            assert stats["total_bytes"] == 1536
+
+
+class TestCheckpointDeleteSession:
+    def test_delete_session(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        fp = tmp_path / "file.py"
+        _make_checkpoint(ckpt_dir, "s1", 1, fp, "content")
+        _make_index(ckpt_dir, [
+            {"session_id": "s1", "project": "p", "cwd": "/",
+             "created": 1000, "last_action": 2000, "action_count": 1, "total_bytes": 7},
+        ])
+
+        with patch.object(data, "CHECKPOINTS_DIR", ckpt_dir), \
+             patch.object(data, "CHECKPOINTS_INDEX", ckpt_dir / "sessions.json"):
+            ok, msg = data.delete_checkpoint_session("s1")
+            assert ok
+            assert not (ckpt_dir / "s1").exists()
+            index = json.loads((ckpt_dir / "sessions.json").read_text())
+            assert len(index) == 0
+
+
+class TestCheckpointToggle:
+    def test_toggle_on_off(self, tmp_path):
+        settings = tmp_path / "settings.json"
+        settings.write_text(json.dumps({"checkpoints_enabled": True}))
+
+        with patch.object(data, "SETTINGS_FILE", settings):
+            new_state = data.toggle_checkpoints()
+            assert new_state is False
+            assert not data.is_checkpoints_enabled()
+
+            new_state = data.toggle_checkpoints()
+            assert new_state is True
+            assert data.is_checkpoints_enabled()
+
+    def test_default_enabled(self, tmp_path):
+        with patch.object(data, "SETTINGS_FILE", tmp_path / "nonexistent.json"):
+            assert data.is_checkpoints_enabled() is True

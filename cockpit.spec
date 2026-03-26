@@ -22,7 +22,7 @@ a = Analysis(
     ["cockpit/__main__.py"],
     pathex=["."],
     binaries=[],
-    datas=textual_datas,
+    datas=textual_datas + [("cockpit/app.tcss", "cockpit")],
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
