@@ -1,17 +1,45 @@
 {
   "hooks": {
-    "Stop": [
+    "PostToolUse": [
       {
+        "matcher": "Edit",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/check_enabled.py",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/git_checkpoint.py",
             "timeout": 3
-          },
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
           {
-            "type": "agent",
-            "prompt": "You are an auto-memory agent. Extract and persist valuable context from this Claude Code session.\n\nSession info from ARGUMENTS: $ARGUMENTS\nUse the transcript_path field to locate the JSONL transcript. The project memory directory is at the same level as the transcript (sibling directory called 'memory/auto/').\n\nSteps:\n1. Use Bash to count user messages: grep -c '\"type\":\"user\"' <transcript_path>. If fewer than 3, skip.\n2. Use Bash to extract recent exchanges: grep '\"type\":\"user\"\\|\"type\":\"assistant\"' <transcript_path> | tail -30\n3. From those messages, identify ANY of:\n   - Decisions: architecture choices, tool/library selections, config changes\n   - Bugs fixed: root cause + what fixed it\n   - Environment discoveries: working commands, paths, port numbers, API patterns\n   - Deferred work: anything postponed ('do X later', 'revisit', 'TODO')\n   - Patterns: techniques that worked, gotchas, things to avoid\n4. If items found, determine auto dir from transcript_path (~/.claude/projects/<slug>/<session>.jsonl -> ~/.claude/projects/<slug>/memory/auto/). Create with mkdir -p.\n5. Write to <auto-dir>/<YYYY-MM-DD>.md (append if exists). Format:\n   ### HH:MM\n   - **Decision:** what — why\n   - **Finding:** what — evidence\n   - **Deferred:** what — context\n6. For deferred items, ALSO append to <project-dir>/memory/MEMORY.md under '## Deferred'.\n\nIMPORTANT: Err on the side of capturing MORE. A 2-line entry costs nothing; losing context costs hours. Only skip if the conversation is truly trivial (greetings, simple yes/no).",
-            "timeout": 60
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/git_checkpoint.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/checkpoint.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/checkpoint.py",
+            "timeout": 5
           }
         ]
       }

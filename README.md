@@ -1,6 +1,6 @@
 # Claude Cockpit
 
-**X-ray vision for Claude Code.** A TUI dashboard that runs alongside your terminal, giving you live visibility into memory, tasks, conversations, context usage, plans, and stats — all without interrupting your workflow.
+**X-ray vision for Claude Code.** A TUI dashboard that runs alongside your terminal, giving you live visibility into memory, tasks, checkpoints, conversations, context usage, plans, and stats — all without interrupting your workflow.
 
 <p align="center">
   <img src="docs/hero.svg?v=2" alt="Claude Code + Cockpit split pane" width="100%">
@@ -105,6 +105,10 @@ Tree view of all memory files by project. Full-text search, inline editing with 
 
 Streams JSONL line-by-line (handles multi-GB files). Paginated, searchable, pin/export/rename sessions. Timeline view groups sessions and memory writes chronologically.
 
+### Checkpoints
+
+Automatic per-action version control. Before every file edit, Cockpit snapshots the original file via a PreToolUse hook. Browse the timeline, see colorized diffs, and rollback individual actions or entire sessions. No git commits needed — works automatically.
+
 ### Plans Viewer
 
 Browse and edit plan files with markdown preview. Pin important plans.
@@ -123,7 +127,7 @@ Usage metrics (model breakdown, tokens, cost, sparklines), searchable command hi
 
 | Key | Action |
 |-----|--------|
-| `m` `t` `p` `c` `s` `h` | Switch tabs (Memory/Tasks/Plans/Conversations/Stats/History) |
+| `m` `t` `p` `k` `c` `s` `h` | Switch tabs (Memory/Tasks/Plans/Checkpoints/Conversations/Stats/History) |
 | `←` `→` | Previous / next tab |
 | `/` | Search |
 | `r` | Refresh all |
@@ -132,6 +136,7 @@ Usage metrics (model breakdown, tokens, cost, sparklines), searchable command hi
 | `q` | Quit |
 | `↓` `↑` `j` `k` | Navigate items (Tasks tab) |
 | `Enter` | Open session in iTerm (Tasks tab) |
+| `r` / `R` | Rollback action / session (Checkpoints) |
 | `e` | Edit (Memory/Plans) |
 | `Ctrl+S` | Save edit |
 | `F2` | Rename (Conversations/Plans) |
@@ -152,6 +157,7 @@ Cockpit reads `~/.claude/` directly. No API calls, no session modifications. Aut
 ├── projects/*/*.jsonl                → Conversations tab
 ├── tasks/*/N.json                    → Tasks tab
 ├── plans/*.md                        → Plans tab
+├── checkpoints/<session>/<seq>/      → Checkpoints tab
 ├── stats-cache.json                  → Stats tab
 ├── history.jsonl                     → History tab
 └── debug/*.txt                       → Context gauge
@@ -164,7 +170,7 @@ Cockpit reads `~/.claude/` directly. No API calls, no session modifications. Aut
 ## Development
 
 ```bash
-.venv/bin/pytest tests/ -v    # 180 tests, <2s
+.venv/bin/pytest tests/ -v    # 210 tests, <2s
 .venv/bin/python -m cockpit   # run directly
 ```
 
